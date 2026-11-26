@@ -745,7 +745,7 @@ const BENCHMARK_LIMITS: readonly string[] = Object.freeze([
   'Intervals are empirical peer-residual quantile bands, not probabilities of a future market cap.',
   'Peers are unevenly supported by category and the holdout is a slug hash, not a random sample of launches.',
   'The peer pool is the adapter tokenized partition, which retains tokenized CEX, bridge and liquid-staking protocols even though candidate eligibility excludes those categories.',
-  'Sparse category offsets are shrunk toward the global fit but remain noisy; check the evidence flags per valuation.',
+  'Category offsets are zero below minCategoryN and shrunk toward the global fit on supported categories; sparse categories remain noisy, so check the evidence flags per valuation.',
   'Point estimates are implied market caps, never FDV, and depend on the frozen peer set.',
   'Final all-peer coefficients are not scored on the holdout; the reported holdout models were fit on training peers only.',
 ]);
@@ -938,7 +938,8 @@ export interface DossierSummary {
   readonly asOf: string;
   readonly method: 'cross-sectional-peer-benchmark';
   readonly peerN: number;
-  readonly candidateN: number;
+  /** Total valuations, including non-watchlist candidates and watchlist rows. */
+  readonly valuationN: number;
   readonly watchlistN: number;
   readonly split: {
     readonly trainN: number;
@@ -1070,7 +1071,11 @@ function dossierLimits(intervalLevel: number): readonly string[] {
   return Object.freeze([
     `The ${percent}% band is a global out-of-fold empirical interval, not a precision guarantee or probability.`,
     'Cross-sectional peer benchmark only; not a forecast, launch backtest, or probability of future market cap.',
-    'Peers are unevenly supported by category; sparse category offsets are suppressed by minCategoryN.',
+    'The peer pool is the adapter tokenized partition and can include tokenized CEX, bridge, and liquid-staking categories that are excluded from candidates.',
+    'The holdout is a deterministic slug-hash split over this cross-sectional snapshot, not a random sample of token launches.',
+    'The final all-peer refit is not scored on the holdout; reported holdout scores come from training-only fits.',
+    'Calibration coverage is training out-of-fold coverage and is distinct from held-out interval coverage.',
+    'Category offsets are zero below minCategoryN and shrunk on supported categories; sparse categories remain noisy.',
     'Implied market caps are not FDV and depend on the frozen peer snapshot.',
   ]);
 }
@@ -1096,7 +1101,7 @@ export function toDossierSummary(
     asOf: benchmark.asOf,
     method: benchmark.method,
     peerN: benchmark.final.fitSampleN,
-    candidateN: benchmark.valuations.length,
+    valuationN: benchmark.valuations.length,
     watchlistN: benchmark.valuations.filter(
       (valuation) => valuation.source === 'watchlist',
     ).length,

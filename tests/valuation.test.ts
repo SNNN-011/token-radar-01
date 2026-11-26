@@ -1445,6 +1445,13 @@ test('benchmarkValuation separates selection, holdout scoring and final refit', 
     'cross-sectional-peer-benchmark',
   );
   assert.ok(benchmark.limits.length >= 3);
+  assert.ok(
+    benchmark.limits.some(
+      (limit) =>
+        /zero below minCategoryN/.test(limit) &&
+        /supported categories/.test(limit),
+    ),
+  );
   assertDeepFrozen(benchmark);
 });
 
@@ -1483,6 +1490,14 @@ test('toDossierSummary is compact, signed and free of raw IDs and records', () =
   assert.equal(summary.valuations.count, 6);
   assert.equal(summary.valuations.watchlistN, 3);
   assert.equal(summary.valuations.candidateN, 3);
+  assert.equal(summary.valuationN, 6);
+  assert.equal(summary.valuationN, summary.valuations.count);
+  assert.equal(
+    summary.valuationN,
+    summary.valuations.watchlistN + summary.valuations.candidateN,
+  );
+  assert.equal(summary.watchlistN, summary.valuations.watchlistN);
+  assert.equal('candidateN' in summary, false);
   assert.deepEqual(summary.valuations.tokenStatusCounts, {
     'already-tokenized': 0,
     'watchlist-unconfirmed': 3,
@@ -1497,6 +1512,39 @@ test('toDossierSummary is compact, signed and free of raw IDs and records', () =
   assert.ok(
     summary.limits.some(
       (limit) => /cross-sectional/i.test(limit) && /not.*forecast/i.test(limit),
+    ),
+  );
+  assert.ok(
+    summary.limits.some(
+      (limit) =>
+        /peer pool/i.test(limit) &&
+        /CEX/.test(limit) &&
+        /bridge/.test(limit) &&
+        /liquid-staking/.test(limit) &&
+        /excluded from candidates/i.test(limit),
+    ),
+  );
+  assert.ok(
+    summary.limits.some(
+      (limit) =>
+        /slug-hash/i.test(limit) &&
+        /cross-sectional/i.test(limit) &&
+        /not.*random.*launches/i.test(limit),
+    ),
+  );
+  assert.ok(
+    summary.limits.some(
+      (limit) =>
+        /all-peer refit/i.test(limit) &&
+        /not scored on the holdout/i.test(limit),
+    ),
+  );
+  assert.ok(
+    summary.limits.some(
+      (limit) =>
+        /calibration coverage/i.test(limit) &&
+        /training out-of-fold/i.test(limit) &&
+        /distinct from held-out/i.test(limit),
     ),
   );
   assert.equal(summary.calibration.level, 0.8);
@@ -1764,7 +1812,18 @@ test(
     );
 
     const summary = toDossierSummary(benchmark);
-    assert.ok(Buffer.byteLength(JSON.stringify(summary), 'utf8') <= 8192);
+    const summaryBytes = Buffer.byteLength(JSON.stringify(summary), 'utf8');
+    assert.ok(
+      summaryBytes <= 8192,
+      `dossier summary is ${summaryBytes} bytes`,
+    );
     assert.equal(summary.valuations.count, report.candidates.length);
+    assert.equal(summary.valuationN, report.candidates.length);
+    assert.equal(summary.valuationN, summary.valuations.count);
+    assert.equal(
+      summary.valuationN,
+      summary.valuations.watchlistN + summary.valuations.candidateN,
+    );
+    assert.equal(summary.watchlistN, summary.valuations.watchlistN);
   },
 );
