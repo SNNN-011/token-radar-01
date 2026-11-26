@@ -1,0 +1,3 @@
+* text=auto eol=lf
+/vendor/makefun-board.ts -text
+/screenshots/*.png binary
