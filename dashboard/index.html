@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Token Radar — Protocol valuation ledger</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="masthead">
+    <div class="masthead__inner">
+      <a class="wordmark" href="#/">Token Radar</a>
+      <p class="masthead__desk">Research ledger</p>
+      <p class="masthead__meta" id="masthead-meta">Waiting for snapshot data</p>
+    </div>
+  </header>
+
+  <main id="main">
+    <div id="app"></div>
+    <noscript>
+      <p class="noscript">This local ledger needs JavaScript to read the generated snapshot. Enable it, then reload the page.</p>
+    </noscript>
+    <p class="visually-hidden" id="announcer" role="status" aria-live="polite"></p>
+  </main>
+
+  <footer class="site-footer">
+    <div class="site-footer__inner">
+      <p id="footer-source">Snapshot source appears here when the generated data file is present.</p>
+      <p class="site-footer__method">Cross-sectional peer benchmark. Not a launch backtest, forecast, or probability.</p>
+    </div>
+  </footer>
+
+  <script src="../data.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
