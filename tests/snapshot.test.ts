@@ -9,6 +9,7 @@ import {
   parseSnapshot,
 } from '../lib/snapshot.ts';
 import type {
+  SnapshotAdvisoryReason,
   SnapshotExclusionReason,
   SnapshotLedgerRow,
   SnapshotReport,
@@ -82,9 +83,17 @@ function onlyRow(
 }
 
 function exclusionsOf(report: SnapshotReport, slug: string): readonly SnapshotExclusionReason[] {
+  return rowOf(report, slug).exclusions;
+}
+
+function advisoriesOf(report: SnapshotReport, slug: string): readonly SnapshotAdvisoryReason[] {
+  return rowOf(report, slug).advisories;
+}
+
+function rowOf(report: SnapshotReport, slug: string): SnapshotLedgerRow {
   const row = report.ledger.find((entry) => entry.slug === slug);
   assert.ok(row, `missing ledger row for ${slug}`);
-  return row.exclusions;
+  return row;
 }
 
 test('maps documented fields into the header and NormalizedToken shape', () => {
@@ -157,7 +166,11 @@ test('maps documented fields into the header and NormalizedToken shape', () => {
   assert.equal(report.floorUsd, FLOOR);
   assert.equal(report.candidates.length, 1);
   assert.equal(report.candidates[0]?.reason, 'watchlist');
+  assert.equal(report.candidates[0]?.coreReason, 'watchlist');
+  assert.deepEqual(report.candidates[0]?.advisories, []);
   assert.equal(report.peers.length, 1);
+  assert.equal(report.peers[0]?.reason, 'peer');
+  assert.equal(report.peers[0]?.coreReason, 'peer');
   assert.equal(report.excluded.length, 0);
 });
 
@@ -295,6 +308,8 @@ test('preserves negative market-cap sentinels instead of coercing them to null',
   const row = onlyRow(report.excluded);
   assert.equal(row.token.marketCapUsd, -1);
   assert.equal(row.reason, 'tokenized-without-usable-market-cap');
+  assert.equal(row.coreReason, 'tokenized-without-usable-market-cap');
+  assert.deepEqual(row.advisories, []);
   assert.deepEqual(row.flags, ['unusable-market-cap']);
 });
 
@@ -360,6 +375,11 @@ test('applies every visible exclusion rule to non-watchlist candidates', () => {
       reasons: ['bridged-category'],
     },
     {
+      slug: 'category-cross-chain-bridge',
+      category: 'Cross Chain Bridge',
+      reasons: ['bridged-category'],
+    },
+    {
       slug: 'category-liquid-staking',
       category: 'Liquid Staking',
       reasons: ['liquid-staking-category'],
@@ -414,8 +434,10 @@ test('applies every visible exclusion rule to non-watchlist candidates', () => {
     const row = report.ledger.find((candidate) => candidate.slug === entry.slug);
     assert.ok(row, `missing row for ${entry.slug}`);
     assert.equal(row.status, 'excluded');
-    assert.equal(row.reason, 'missing-token-metadata');
+    assert.equal(row.reason, entry.reasons[0]);
+    assert.equal(row.coreReason, 'missing-token-metadata');
     assert.deepEqual(row.exclusions, entry.reasons);
+    assert.deepEqual(row.advisories, []);
   });
 });
 
@@ -440,10 +462,15 @@ test('preserves every matching reason, in documented rule order, on one row', ()
     'liquid-staking-category',
     'exchange-branded-name',
   ]);
+  const multi = rowOf(report, 'multi-rule');
+  assert.equal(multi.reason, 'wrapped-or-staked-name');
+  assert.equal(multi.coreReason, 'missing-token-metadata');
+  assert.deepEqual(multi.advisories, []);
   assert.deepEqual(exclusionsOf(report, 'version-and-bridge'), [
     'versioned-name',
     'bridged-category',
   ]);
+  assert.equal(rowOf(report, 'version-and-bridge').reason, 'versioned-name');
 });
 
 test('keeps the watchlist authoritative over every visible exclusion rule', () => {
@@ -463,9 +490,99 @@ test('keeps the watchlist authoritative over every visible exclusion rule', () =
   const row = onlyRow(report.candidates);
   assert.equal(row.status, 'candidate');
   assert.equal(row.reason, 'watchlist');
+  assert.equal(row.coreReason, 'watchlist');
   assert.deepEqual(row.exclusions, []);
+  assert.deepEqual(row.advisories, []);
   assert.equal(report.excluded.length, 0);
   assert.equal(row.token.watchlist, true);
+});
+
+test('uses only own category keys for exclusion lookups', () => {
+  const categories = ['constructor', 'prototype', 'toString', '__proto__'];
+  const report = adaptSnapshot(
+    doc(
+      categories.map((category, index) =>
+        protocol({
+          slug: `category-key-${index}`,
+          name: `Category Key ${index}`,
+          category,
+        }),
+      ),
+    ),
+  );
+
+  assert.equal(report.candidates.length, categories.length);
+  assert.ok(
+    report.candidates.every(
+      (row) =>
+        row.reason === 'missing-token-metadata' &&
+        row.coreReason === 'missing-token-metadata' &&
+        row.exclusions.length === 0 &&
+        row.advisories.length === 0,
+    ),
+  );
+});
+
+test('separates explicit exclusions from Stablecoin Wrapper advisories', () => {
+  const report = adaptSnapshot(
+    doc(
+      [
+        protocol({
+          slug: 'wrapper-candidate',
+          name: 'Wrapper Candidate',
+          category: 'Stablecoin Wrapper',
+        }),
+        protocol({
+          slug: 'wrapper-watch',
+          name: 'Saturn',
+          category: 'Stablecoin Wrapper',
+        }),
+        protocol({
+          slug: 'wrapper-peer',
+          name: 'Wrapper Peer',
+          category: 'Stablecoin Wrapper',
+          gecko_id: 'wrapper-peer',
+          symbol: 'WRP',
+          mcap_usd: 100,
+        }),
+        protocol({
+          slug: 'wrapper-gecko-only',
+          name: 'Wrapper Gecko Only',
+          category: 'Stablecoin Wrapper',
+          gecko_id: 'wrapper-gecko-only',
+          symbol: 'WGO',
+          mcap_usd: 0,
+        }),
+      ],
+      ['wrapper-watch'],
+    ),
+  );
+
+  const candidate = rowOf(report, 'wrapper-candidate');
+  assert.equal(candidate.status, 'candidate');
+  assert.equal(candidate.reason, 'missing-token-metadata');
+  assert.equal(candidate.coreReason, 'missing-token-metadata');
+  assert.deepEqual(candidate.exclusions, []);
+  assert.deepEqual(candidate.advisories, ['stablecoin-wrapper-category']);
+
+  const watched = rowOf(report, 'wrapper-watch');
+  assert.equal(watched.status, 'candidate');
+  assert.equal(watched.reason, 'watchlist');
+  assert.equal(watched.coreReason, 'watchlist');
+  assert.deepEqual(watched.exclusions, []);
+  assert.deepEqual(watched.advisories, ['stablecoin-wrapper-category']);
+
+  const peer = rowOf(report, 'wrapper-peer');
+  assert.equal(peer.status, 'peer');
+  assert.equal(peer.reason, 'peer');
+  assert.deepEqual(peer.exclusions, []);
+  assert.deepEqual(peer.advisories, []);
+
+  const tokenizedNoCap = rowOf(report, 'wrapper-gecko-only');
+  assert.equal(tokenizedNoCap.status, 'excluded');
+  assert.equal(tokenizedNoCap.reason, 'tokenized-without-usable-market-cap');
+  assert.deepEqual(tokenizedNoCap.exclusions, []);
+  assert.deepEqual(tokenizedNoCap.advisories, []);
 });
 
 test('leaves peers and core exclusions untouched by the snapshot overlay', () => {
@@ -477,6 +594,14 @@ test('leaves peers and core exclusions untouched by the snapshot overlay', () =>
         category: 'Liquid Staking',
         symbol: 'GOLD',
         gecko_id: 'gold',
+        mcap_usd: 10_000,
+      }),
+      protocol({
+        slug: 'bridge-peer',
+        name: 'Circle Gateway',
+        category: 'Cross Chain Bridge',
+        symbol: 'CGW',
+        gecko_id: 'cgw',
         mcap_usd: 10_000,
       }),
       protocol({
@@ -493,16 +618,28 @@ test('leaves peers and core exclusions untouched by the snapshot overlay', () =>
   assert.ok(peer);
   assert.equal(peer.status, 'peer');
   assert.equal(peer.reason, 'peer');
+  assert.equal(peer.coreReason, 'peer');
   assert.deepEqual(peer.exclusions, []);
+  assert.deepEqual(peer.advisories, []);
+
+  const bridgePeer = report.ledger.find((row) => row.slug === 'bridge-peer');
+  assert.ok(bridgePeer);
+  assert.equal(bridgePeer.status, 'peer');
+  assert.equal(bridgePeer.reason, 'peer');
+  assert.equal(bridgePeer.coreReason, 'peer');
+  assert.deepEqual(bridgePeer.exclusions, []);
+  assert.deepEqual(bridgePeer.advisories, []);
 
   const coreExcluded = report.ledger.find((row) => row.slug === 'wrapped-peer');
   assert.ok(coreExcluded);
   assert.equal(coreExcluded.status, 'excluded');
   assert.equal(coreExcluded.reason, 'apparent-wrapper');
+  assert.equal(coreExcluded.coreReason, 'apparent-wrapper');
   assert.deepEqual(coreExcluded.exclusions, []);
+  assert.deepEqual(coreExcluded.advisories, []);
 });
 
-test('does not infer parentProtocol and never uses the floor as a ceiling', () => {
+test('keeps the floor as the watchlist threshold only and never infers parentProtocol', () => {
   const report = adaptSnapshot(
     doc([
       protocol({
@@ -518,6 +655,12 @@ test('does not infer parentProtocol and never uses the floor as a ceiling', () =
         tvl_usd: FLOOR - 1,
       }),
       protocol({
+        slug: 'well-below-floor-mystery',
+        name: 'Tiny Launch',
+        category: 'Yield',
+        tvl_usd: 5_000_000,
+      }),
+      protocol({
         slug: 'below-floor-cex',
         name: 'Small Exchange',
         category: 'CEX',
@@ -528,12 +671,19 @@ test('does not infer parentProtocol and never uses the floor as a ceiling', () =
 
   assert.deepEqual(
     report.candidates.map((row) => row.slug),
-    ['above-floor-mystery', 'below-floor-mystery'],
+    ['above-floor-mystery', 'below-floor-mystery', 'well-below-floor-mystery'],
   );
   assert.ok(
-    report.candidates.every((row) => row.reason === 'missing-token-metadata'),
+    report.candidates.every(
+      (row) =>
+        row.reason === 'missing-token-metadata' &&
+        row.coreReason === 'missing-token-metadata' &&
+        row.exclusions.length === 0 &&
+        row.advisories.length === 0,
+    ),
   );
   assert.deepEqual(exclusionsOf(report, 'below-floor-cex'), ['cex-category']);
+  assert.equal(rowOf(report, 'below-floor-cex').reason, 'cex-category');
 });
 
 test('reconciles, sorts, and freezes every partition and nested value', () => {
@@ -584,6 +734,7 @@ test('reconciles, sorts, and freezes every partition and nested value', () => {
   assert.ok(report.ledger.every((row) => Object.isFrozen(row)));
   assert.ok(report.ledger.every((row) => Object.isFrozen(row.flags)));
   assert.ok(report.ledger.every((row) => Object.isFrozen(row.exclusions)));
+  assert.ok(report.ledger.every((row) => Object.isFrozen(row.advisories)));
   assert.ok(report.ledger.every((row) => Object.isFrozen(row.token)));
   assert.ok(report.ledger.every((row) => Object.isFrozen(row.token.chains)));
 
@@ -604,15 +755,41 @@ test('returns empty reconciled partitions for an empty document', () => {
 
 const REAL_SNAPSHOT_SHA256 =
   '42a71213519479f3a180cc5010cbbf6bd18a2447fa0ad29e4c5122b6c9184393';
-const realSnapshotPath =
-  process.env.TOKEN_RADAR_SNAPSHOT ??
-  'D:/hermes/cache/scratch/token-radar-snapshot/snapshot.json';
-const realSnapshotAvailable = existsSync(realSnapshotPath);
+const realSnapshotPath = process.env.TOKEN_RADAR_SNAPSHOT;
+const requireRealSnapshot = process.env.TOKEN_RADAR_REQUIRE_SNAPSHOT === '1';
+
+if (
+  requireRealSnapshot &&
+  (realSnapshotPath === undefined || realSnapshotPath.length === 0)
+) {
+  throw new Error(
+    'TOKEN_RADAR_REQUIRE_SNAPSHOT=1 requires TOKEN_RADAR_SNAPSHOT to name the hash-verified snapshot file',
+  );
+}
+if (
+  requireRealSnapshot &&
+  realSnapshotPath !== undefined &&
+  realSnapshotPath.length > 0 &&
+  !existsSync(realSnapshotPath)
+) {
+  throw new Error(
+    `TOKEN_RADAR_REQUIRE_SNAPSHOT=1: hash-verified snapshot not found at ${realSnapshotPath}`,
+  );
+}
+const realSnapshotSkip =
+  realSnapshotPath === undefined || realSnapshotPath.length === 0
+    ? 'TOKEN_RADAR_SNAPSHOT is not set'
+    : !existsSync(realSnapshotPath)
+      ? `snapshot not found at ${realSnapshotPath}`
+      : false;
 
 test(
-  'adapts the verified real snapshot with exact reconciliation',
-  { skip: !realSnapshotAvailable },
+  'integration: adapts the verified real snapshot with exact reconciliation',
+  { skip: realSnapshotSkip },
   () => {
+    if (realSnapshotPath === undefined || realSnapshotPath.length === 0) {
+      throw new Error('integration test ran without TOKEN_RADAR_SNAPSHOT');
+    }
     const bytes = readFileSync(realSnapshotPath);
     assert.equal(
       createHash('sha256').update(bytes).digest('hex'),
@@ -637,16 +814,19 @@ test(
     assert.equal(raw.protocols.length, 758);
     assert.equal(raw.watchlist.length, 40);
     assert.equal(report.ledger.length, 758);
-    assert.equal(report.candidates.length, 198);
+    assert.equal(report.candidates.length, 197);
     assert.equal(report.peers.length, 127);
-    assert.equal(report.excluded.length, 433);
+    assert.equal(report.excluded.length, 434);
     assert.equal(
       report.candidates.length + report.peers.length + report.excluded.length,
       report.ledger.length,
     );
 
     const watched = report.candidates.filter(
-      (row) => row.reason === 'watchlist' && row.token.watchlist === true,
+      (row) =>
+        row.reason === 'watchlist' &&
+        row.coreReason === 'watchlist' &&
+        row.token.watchlist === true,
     );
     assert.equal(watched.length, 40);
     assert.deepEqual(
@@ -656,17 +836,21 @@ test(
     assert.ok(watched.every((row) => row.exclusions.length === 0));
 
     const overlaid = report.ledger.filter((row) => row.exclusions.length > 0);
-    assert.equal(overlaid.length, 133);
+    assert.equal(overlaid.length, 134);
     assert.ok(
       overlaid.every(
-        (row) => row.status === 'excluded' && row.token.watchlist !== true,
+        (row) =>
+          row.status === 'excluded' &&
+          row.token.watchlist !== true &&
+          row.reason === row.exclusions[0] &&
+          row.coreReason === 'missing-token-metadata',
       ),
     );
     assert.equal(
       overlaid.filter((row) =>
         row.exclusions.includes('bridged-category'),
       ).length,
-      43,
+      44,
     );
     assert.equal(
       overlaid.filter((row) =>
@@ -705,6 +889,32 @@ test(
       14,
     );
 
+    const advisoryRows = report.ledger.filter(
+      (row) => row.advisories.length > 0,
+    );
+    assert.equal(advisoryRows.length, 2);
+    assert.deepEqual(
+      advisoryRows.map((row) => row.slug).sort(),
+      ['saturn', 'usdcx'],
+    );
+    assert.ok(
+      advisoryRows.every(
+        (row) =>
+          row.status === 'candidate' &&
+          row.exclusions.length === 0 &&
+          row.advisories.includes('stablecoin-wrapper-category'),
+      ),
+    );
+
+    const crossChainBridge = report.ledger.find(
+      (row) => row.slug === 'circle-gateway',
+    );
+    assert.ok(crossChainBridge);
+    assert.equal(crossChainBridge.status, 'excluded');
+    assert.equal(crossChainBridge.reason, 'bridged-category');
+    assert.equal(crossChainBridge.coreReason, 'missing-token-metadata');
+    assert.deepEqual(crossChainBridge.exclusions, ['bridged-category']);
+
     const belowFloorCandidates = report.candidates.filter(
       (row) =>
         row.reason === 'missing-token-metadata' &&
@@ -717,7 +927,7 @@ test(
           row.reason === 'missing-token-metadata' &&
           (row.token.tvlUsd ?? 0) >= report.floorUsd,
       ).length,
-      20,
+      19,
     );
 
     assert.ok(Object.isFrozen(report.candidates));
@@ -728,9 +938,12 @@ test(
 );
 
 test(
-  'rejects the real snapshot if its manifest hash is not the verified one',
-  { skip: !realSnapshotAvailable },
+  'integration: rejects the real snapshot if its manifest hash is not the verified one',
+  { skip: realSnapshotSkip },
   () => {
+    if (realSnapshotPath === undefined || realSnapshotPath.length === 0) {
+      throw new Error('integration test ran without TOKEN_RADAR_SNAPSHOT');
+    }
     const bytes = readFileSync(realSnapshotPath);
     const actual = createHash('sha256').update(bytes).digest('hex');
     assert.equal(actual, REAL_SNAPSHOT_SHA256);

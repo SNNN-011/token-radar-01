@@ -12,10 +12,12 @@
  *    the core classifier. The core reason for every row is retained.
  * 3. A narrow, snapshot-only overlay then applies the exclusion rules that are
  *    visible in the file to non-watchlist candidates: versioned names,
- *    wrapped/staked names, the bridge/staking/CEX categories, and exchange-
- *    branded names. `parentProtocol` is deliberately not modelled: it is not
- *    one of the ten documented fields, so a non-watchlist tokenless protocol is
- *    never excluded merely because a parent is suspected.
+ *    wrapped/staked names, the bridge (including Cross Chain Bridge)/staking/
+ *    CEX categories, and exchange-branded names. `Stablecoin Wrapper` is kept
+ *    separate as an advisory ambiguity, not an exclusion. `parentProtocol` is
+ *    deliberately not modelled: it is not one of the ten documented fields, so
+ *    a non-watchlist tokenless protocol is never excluded merely because a
+ *    parent is suspected.
  *
  * The watchlist is authoritative. A watchlisted protocol remains a candidate
  * even when its name or category looks like a visible exclusion; the overlay
@@ -27,6 +29,7 @@
 
 import { classify } from './universe.ts';
 import type {
+  ClassificationReason,
   LedgerRow,
   LedgerStatus,
   NormalizedToken,
@@ -52,14 +55,30 @@ export type SnapshotExclusionReason =
   | 'cex-category'
   | 'exchange-branded-name';
 
+/** Ambiguous scope signals that never move a row out of candidates by themselves. */
+export type SnapshotAdvisoryReason = 'stablecoin-wrapper-category';
+
+/** Effective reason: a snapshot exclusion, or the untouched core reason. */
+export type SnapshotReason = ClassificationReason | SnapshotExclusionReason;
+
 /**
- * A core ledger row plus the snapshot-only exclusion evidence. `reason` and
- * `flags` remain the core classification of the token; `exclusions` explains
- * why a core candidate was moved to `excluded` by this adapter. `status` is the
- * effective status used by the partitions.
+ * A core ledger row plus separate snapshot diagnostics.
+ *
+ * - `coreReason` is always the untouched `lib/universe.ts` classification.
+ * - `reason` is the effective reason: for an overlay-excluded candidate it is
+ *   the first explicit exclusion in documented rule order; otherwise it equals
+ *   `coreReason`.
+ * - `exclusions` lists explicit known-product signals that may exclude a
+ *   non-watchlist candidate.
+ * - `advisories` lists ambiguous scope signals that never exclude by
+ *   themselves. `Stablecoin Wrapper` is advisory unless strong token evidence
+ *   contradicts it.
  */
-export interface SnapshotLedgerRow extends LedgerRow {
+export interface SnapshotLedgerRow extends Omit<LedgerRow, 'reason'> {
+  readonly reason: SnapshotReason;
+  readonly coreReason: ClassificationReason;
   readonly exclusions: readonly SnapshotExclusionReason[];
+  readonly advisories: readonly SnapshotAdvisoryReason[];
 }
 
 export interface SnapshotReport extends SnapshotHeader {
@@ -385,11 +404,24 @@ const CATEGORY_EXCLUSIONS: Readonly<Record<string, SnapshotExclusionReason>> =
   Object.freeze({
     Bridge: 'bridged-category',
     'Canonical Bridge': 'bridged-category',
+    'Cross Chain Bridge': 'bridged-category',
     'Liquid Staking': 'liquid-staking-category',
     'Liquid Restaking': 'liquid-restaking-category',
     'Restaked BTC': 'restaked-btc-category',
     CEX: 'cex-category',
   });
+
+function categoryExclusion(
+  category: string | null | undefined,
+): SnapshotExclusionReason | undefined {
+  if (typeof category !== 'string') return undefined;
+  // A plain object lookup would also return inherited keys such as
+  // "constructor" or "__proto__"; categories are untrusted strings.
+  if (!Object.prototype.hasOwnProperty.call(CATEGORY_EXCLUSIONS, category)) {
+    return undefined;
+  }
+  return CATEGORY_EXCLUSIONS[category];
+}
 
 const EXCHANGE_NAMES = [
   'Binance',
@@ -408,10 +440,34 @@ const VERSION_SUFFIX = /\s(?:V\d+(?:\.\d+)?|v\d+(?:\.\d+)?|\d+\.\d+)$/;
 const WRAPPED_OR_STAKED_WORD = /\b(?:wrapped|staked|staking)\b/i;
 
 const NO_EXCLUSIONS: readonly SnapshotExclusionReason[] = Object.freeze([]);
+const NO_ADVISORIES: readonly SnapshotAdvisoryReason[] = Object.freeze([]);
+const STABLECOIN_WRAPPER_ADVISORY: readonly SnapshotAdvisoryReason[] =
+  Object.freeze(['stablecoin-wrapper-category']);
+
+function hasStrongTokenEvidence(token: NormalizedToken): boolean {
+  const geckoId =
+    typeof token.geckoId === 'string' && token.geckoId.trim().length > 0;
+  const usableMarketCap =
+    typeof token.marketCapUsd === 'number' &&
+    Number.isFinite(token.marketCapUsd) &&
+    token.marketCapUsd > 0;
+  return geckoId || usableMarketCap;
+}
+
+function advisoriesFor(token: NormalizedToken): readonly SnapshotAdvisoryReason[] {
+  if (token.category !== 'Stablecoin Wrapper') return NO_ADVISORIES;
+  // The category is broad, and a protocol with a gecko id or usable market cap
+  // has positive token evidence. Treat the wrapper label as ambiguous advice,
+  // never as an exclusion; watchlist status still wins.
+  return hasStrongTokenEvidence(token)
+    ? NO_ADVISORIES
+    : STABLECOIN_WRAPPER_ADVISORY;
+}
 
 /**
  * Evidence visible in the ten documented fields. `parentProtocol` is absent
- * from the snapshot by design and therefore cannot appear here.
+ * from the snapshot by design and therefore cannot appear here. TVL is not
+ * consulted: the floor is the watchlist threshold, not an exclusion threshold.
  */
 function visibleExclusions(
   token: NormalizedToken,
@@ -426,11 +482,9 @@ function visibleExclusions(
     reasons.push('wrapped-or-staked-name');
   }
 
-  if (typeof token.category === 'string') {
-    const categoryReason = CATEGORY_EXCLUSIONS[token.category];
-    if (categoryReason !== undefined) {
-      reasons.push(categoryReason);
-    }
+  const categoryReason = categoryExclusion(token.category);
+  if (categoryReason !== undefined) {
+    reasons.push(categoryReason);
   }
 
   const lowerName = name.toLowerCase();
@@ -452,14 +506,17 @@ function overlayRow(row: LedgerRow): SnapshotLedgerRow {
       : NO_EXCLUSIONS;
   const status: LedgerStatus =
     exclusions.length > 0 ? 'excluded' : row.status;
+  const reason: SnapshotReason = exclusions[0] ?? row.reason;
 
   return Object.freeze({
     slug: row.slug,
     status,
-    reason: row.reason,
+    reason,
+    coreReason: row.reason,
     flags: row.flags,
     token: row.token,
     exclusions,
+    advisories: advisoriesFor(row.token),
   });
 }
 
