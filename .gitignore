@@ -1,0 +1,19 @@
+# Machine-local inputs and outputs
+/.local/
+/input/
+/output/
+/output-*/
+/.env
+/.env.*
+/node_modules/
+
+# Keep keys, recordings and transcript bundles outside the source repository.
+*.tar.gz
+*.sqlite*
+*.db
+*.db-shm
+*.db-wal
+*keypair*.json
+*.pem
+*.key
+credentials
