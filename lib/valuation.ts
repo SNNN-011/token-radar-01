@@ -12,8 +12,14 @@
  *   fallback when a category has fewer than `minCategoryN` peers.
  * - `scale-partially-pooled`: log-log regression on log(TVL), optional capped
  *   7d TVL change and capped age, plus per-category median residuals shrunk
- *   toward zero by n / (n + k). The regression may be ordinary least squares
- *   or deterministic Huber reweighting.
+ *   toward zero by n / (n + k) only when the category has at least
+ *   `minCategoryN` peers; below that threshold the offset is zero and the
+ *   category carries an explicit suppression diagnostic.
+ *
+ * Public candidate output also carries a neutral `tokenStatus`: a watchlist row
+ * already backed by a usable market cap or gecko id is `already-tokenized`,
+ * other watchlist rows are `watchlist-unconfirmed` (never claimed as pre-token),
+ * and non-watchlist tokenless rows are `candidate`.
  *
  * Nothing here is a launch backtest or a probability. A point estimate is a
  * cross-sectional benchmark; an interval is an empirical quantile band built
@@ -54,6 +60,10 @@ export interface ValuationTarget {
   readonly change7d: number | null;
   readonly ageDays: number | null;
   readonly watchlist?: boolean;
+  /** Strong token evidence carried from the snapshot ledger. */
+  readonly alreadyTokenized?: boolean;
+  /** Actual market cap when one exists; null when tokenized without an mcap. */
+  readonly actualMarketCapUsd?: number | null;
 }
 
 export interface ValuationModelSpec {
@@ -68,13 +78,19 @@ export interface ValuationModelSpec {
 export interface CategoryStat {
   readonly category: string;
   readonly n: number;
+  /** True when n >= minCategoryN; false means no category adjustment. */
+  readonly supported: boolean;
+  /** True when support is below minCategoryN. */
+  readonly belowMinCategoryN: boolean;
   /** Median log(marketCap / TVL) for category baselines; null when unsupported. */
   readonly medianLogRatio: number | null;
   /** Median residual from the global regression, before shrinkage. */
   readonly residualMedianLog: number | null;
   /** Shrunken additive log offset applied by the scale-aware model. */
   readonly offsetLog: number;
-  /** n / (n + categoryShrinkage). */
+  /** True only when the offset is actually applied (supported category). */
+  readonly offsetApplied: boolean;
+  /** n / (n + categoryShrinkage), or zero when support is below minCategoryN. */
   readonly weight: number;
 }
 
@@ -114,6 +130,7 @@ export type ValuationEvidenceFlag =
   | 'category-partially-pooled'
   | 'category-unseen'
   | 'sparse-category'
+  | 'category-offset-suppressed'
   | 'category-adjustment-large'
   | 'tvl-below-fit-range'
   | 'tvl-above-fit-range'
@@ -121,6 +138,11 @@ export type ValuationEvidenceFlag =
   | 'missing-listed-at'
   | 'interval-wide'
   | 'small-calibration-sample';
+
+export type ValuationTokenStatus =
+  | 'already-tokenized'
+  | 'watchlist-unconfirmed'
+  | 'candidate';
 
 export interface PeerExample {
   readonly slug: string;
@@ -137,6 +159,8 @@ export interface TokenValuation {
   readonly category: string | null;
   readonly tvlUsd: number;
   readonly source: 'watchlist' | 'candidate';
+  readonly tokenStatus: ValuationTokenStatus;
+  readonly actualMarketCapUsd: number | null;
   readonly pointBasis: 'market-cap';
   readonly impliedMarketCapUsd: number;
   readonly impliedLogMarketCap: number;
@@ -801,6 +825,7 @@ function categoryResidualStats(
   rows: readonly DesignRow[],
   coefficients: readonly number[],
   shrinkage: number,
+  minCategoryN: number,
 ): readonly CategoryStat[] {
   const grouped = new Map<string, number[]>();
   rows.forEach((row) => {
@@ -819,14 +844,18 @@ function categoryResidualStats(
       .sort(([left], [right]) => compareSlugs(left, right))
       .map(([category, residuals]) => {
         const n = residuals.length;
+        const supported = n >= minCategoryN;
         const residualMedian = median(residuals);
-        const weight = n / (n + shrinkage);
+        const weight = supported ? n / (n + shrinkage) : 0;
         return Object.freeze({
           category,
           n,
+          supported,
+          belowMinCategoryN: !supported,
           medianLogRatio: null,
           residualMedianLog: residualMedian,
-          offsetLog: weight * residualMedian,
+          offsetLog: supported ? weight * residualMedian : 0,
+          offsetApplied: supported,
           weight,
         });
       }),
@@ -856,9 +885,12 @@ function categoryMedianStats(
         return Object.freeze({
           category,
           n: ratios.length,
+          supported,
+          belowMinCategoryN: !supported,
           medianLogRatio: supported ? median(ratios) : null,
           residualMedianLog: null,
           offsetLog: 0,
+          offsetApplied: false,
           weight: 0,
         });
       }),
@@ -1020,6 +1052,7 @@ export function fitValuationModel(
       rows,
       linear.coefficients,
       spec.categoryShrinkage,
+      spec.minCategoryN,
     ),
     iterations: linear.iterations,
     converged: linear.converged,
@@ -1105,17 +1138,24 @@ function evidenceFlagsFor(
   } else {
     if (category === undefined) {
       flags.push('category-unseen');
-    } else {
+    } else if (category.offsetApplied) {
       flags.push('category-partially-pooled');
     }
   }
 
   if (
     category !== undefined &&
-    category.n < options.minCategoryN &&
+    category.n < model.spec.minCategoryN &&
     model.spec.kind !== 'global-median-ratio'
   ) {
     flags.push('sparse-category');
+  }
+  if (
+    model.spec.kind === 'scale-partially-pooled' &&
+    category !== undefined &&
+    category.offsetApplied === false
+  ) {
+    flags.push('category-offset-suppressed');
   }
   if (category !== undefined && Math.abs(category.offsetLog) >= 1) {
     flags.push('category-adjustment-large');
@@ -1135,19 +1175,42 @@ function evidenceFlagsFor(
 }
 
 /**
- * Produce one implied market-cap benchmark with an empirical interval and
- * stable nearest-peer evidence. The target must have positive TVL; the model's
- * own fitting peers are the only allowed evidence pool.
+ * Enforce that the public evidence pool is exactly the model's fit set. This
+ * prevents a caller from attaching unrelated peers to a frozen model.
  */
-export function valueToken(
-  target: ValuationTarget,
+function validateEvidencePeerSet(
   model: FittedValuationModel,
   peers: readonly ValuationPeer[],
-  calibration: IntervalCalibration,
-  inputOptions: Partial<ValuationOptions> = {},
-): TokenValuation {
-  const options = resolveValuationOptions(inputOptions);
-  const logTvl = assertPositiveTargetTvl(target);
+): ReadonlySet<string> {
+  if (peers.length === 0) {
+    throw new ValuationInputError(
+      'at least one peer is required to produce peer evidence',
+    );
+  }
+  peers.forEach(assertPeer);
+  assertUniqueSlugs(peers);
+
+  if (peers.length !== model.fitSlugs.length) {
+    throw new ValuationInputError(
+      `valuation requires the exact fit peer set (${model.fitSlugs.length} peers), received ${peers.length}`,
+    );
+  }
+  const fitSlugs = new Set(model.fitSlugs);
+  const peerSlugs = new Set(peers.map((peerValue) => peerValue.slug));
+  if (
+    peerSlugs.size !== peers.length ||
+    fitSlugs.size !== model.fitSlugs.length ||
+    [...peerSlugs].some((slug) => !fitSlugs.has(slug)) ||
+    model.fitSlugs.some((slug) => !peerSlugs.has(slug))
+  ) {
+    throw new ValuationInputError(
+      'valuation requires the exact fit peer set; supplied peers do not match model.fitSlugs',
+    );
+  }
+  return fitSlugs;
+}
+
+function assertValuationCalibration(calibration: IntervalCalibration): void {
   if (
     !isFiniteNumber(calibration.level) ||
     calibration.level <= 0 ||
@@ -1158,14 +1221,30 @@ export function valueToken(
   ) {
     throw new ValuationInputError('valuation calibration is malformed');
   }
-  if (peers.length === 0) {
-    throw new ValuationInputError(
-      'at least one peer is required to produce peer evidence',
-    );
-  }
-  peers.forEach(assertPeer);
-  assertUniqueSlugs(peers);
+}
 
+function tokenStatusFor(target: ValuationTarget): ValuationTokenStatus {
+  if (target.alreadyTokenized === true) return 'already-tokenized';
+  if (target.watchlist === true) return 'watchlist-unconfirmed';
+  return 'candidate';
+}
+
+function actualMarketCapFor(target: ValuationTarget): number | null {
+  return typeof target.actualMarketCapUsd === 'number' &&
+    Number.isFinite(target.actualMarketCapUsd) &&
+    target.actualMarketCapUsd > 0
+    ? target.actualMarketCapUsd
+    : null;
+}
+
+function buildValuation(
+  target: ValuationTarget,
+  model: FittedValuationModel,
+  peers: readonly ValuationPeer[],
+  calibration: IntervalCalibration,
+  options: ValuationOptions,
+): TokenValuation {
+  const logTvl = assertPositiveTargetTvl(target);
   const logPoint = predictLogMarketCap(model, target, options);
   const lowLog = Math.min(
     logPoint + calibration.lowerLogOffset,
@@ -1221,6 +1300,8 @@ export function valueToken(
     category: target.category,
     tvlUsd: target.tvlUsd,
     source: target.watchlist === true ? 'watchlist' : 'candidate',
+    tokenStatus: tokenStatusFor(target),
+    actualMarketCapUsd: actualMarketCapFor(target),
     pointBasis: 'market-cap',
     impliedMarketCapUsd: pointUsd,
     impliedLogMarketCap: logPoint,
@@ -1245,6 +1326,29 @@ export function valueToken(
       options,
     ),
   });
+}
+
+/**
+ * Produce one implied market-cap benchmark with an empirical interval and
+ * stable nearest-peer evidence. The public evidence pool must be exactly the
+ * model's frozen fit set, and the target must not be one of those fit peers.
+ */
+export function valueToken(
+  target: ValuationTarget,
+  model: FittedValuationModel,
+  peers: readonly ValuationPeer[],
+  calibration: IntervalCalibration,
+  inputOptions: Partial<ValuationOptions> = {},
+): TokenValuation {
+  const options = resolveValuationOptions(inputOptions);
+  assertValuationCalibration(calibration);
+  const fitSlugs = validateEvidencePeerSet(model, peers);
+  if (fitSlugs.has(target.slug)) {
+    throw new ValuationInputError(
+      `${target.slug} is in the fit set; public valueToken cannot score fitted peers`,
+    );
+  }
+  return buildValuation(target, model, peers, calibration, options);
 }
 
 function targetFromCandidate(
@@ -1279,12 +1383,20 @@ function targetFromCandidate(
         : null,
     ageDays,
     watchlist: token.watchlist === true,
+    alreadyTokenized: row.flags.includes('already-tokenized'),
+    actualMarketCapUsd:
+      typeof token.marketCapUsd === 'number' &&
+      Number.isFinite(token.marketCapUsd) &&
+      token.marketCapUsd > 0
+        ? token.marketCapUsd
+        : null,
   });
 }
 
 /**
  * Value every candidate in the snapshot, including watchlist rows and
- * tokenless protocols. Ordering is exact slug codepoint order.
+ * tokenless protocols. Ordering is exact slug codepoint order. Peer-set
+ * validation happens once per batch, not once per target.
  */
 export function valueCandidates(
   report: SnapshotReport,
@@ -1294,16 +1406,18 @@ export function valueCandidates(
   inputOptions: Partial<ValuationOptions> = {},
 ): readonly TokenValuation[] {
   const options = resolveValuationOptions(inputOptions);
+  assertValuationCalibration(calibration);
+  const fitSlugs = validateEvidencePeerSet(model, peers);
   const asOfDay = utcDayNumber(report.asOf);
-  const valuations = report.candidates.map((row) =>
-    valueToken(
-      targetFromCandidate(row, asOfDay),
-      model,
-      peers,
-      calibration,
-      options,
-    ),
-  );
+  const valuations = report.candidates.map((row) => {
+    const target = targetFromCandidate(row, asOfDay);
+    if (fitSlugs.has(target.slug)) {
+      throw new ValuationInputError(
+        `${target.slug} is in the fit set; candidates must be out-of-fit`,
+      );
+    }
+    return buildValuation(target, model, peers, calibration, options);
+  });
 
   return Object.freeze(
     valuations.sort((left, right) => compareSlugs(left.slug, right.slug)),

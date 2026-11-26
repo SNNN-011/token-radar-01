@@ -69,6 +69,10 @@ export interface ModelEvaluation {
   readonly medianAbsLogError: number;
   readonly meanAbsLogError: number;
   readonly rootMeanSquaredLogError: number;
+  /** Median(actual log - predicted log); positive means underprediction. */
+  readonly medianSignedLogError: number;
+  /** Mean(actual log - predicted log); positive means underprediction. */
+  readonly meanSignedLogError: number;
   readonly medianAbsolutePercentageError: number;
   readonly coverage: number;
   readonly medianIntervalLogWidth: number;
@@ -257,11 +261,10 @@ function tvlSegment(
 function categorySegment(
   model: FittedValuationModel,
   category: string | null,
-  options: ValuationOptions,
 ): 'category-supported' | 'category-sparse' | 'category-unseen' {
   const stat = categoryStatFor(model, category);
   if (stat === undefined) return 'category-unseen';
-  return stat.n >= options.minCategoryN
+  return stat.supported
     ? 'category-supported'
     : 'category-sparse';
 }
@@ -304,6 +307,7 @@ export function evaluateValuationModel(
   }
 
   const seen = new Set<string>();
+  const fitSlugs = new Set(model.fitSlugs);
   const records = targets.map((target): EvaluationRecord => {
     if (seen.has(target.slug)) {
       throw new ValuationInputError(
@@ -311,6 +315,11 @@ export function evaluateValuationModel(
       );
     }
     seen.add(target.slug);
+    if (fitSlugs.has(target.slug)) {
+      throw new ValuationInputError(
+        `${target.slug} is in the fit set; evaluateValuationModel requires out-of-fit targets`,
+      );
+    }
     if (!isFiniteNumber(target.marketCapUsd) || target.marketCapUsd <= 0) {
       throw new ValuationInputError(
         `${target.slug}.marketCapUsd must be a positive finite number`,
@@ -345,6 +354,9 @@ export function evaluateValuationModel(
   const sortedRecords = [...records].sort((left, right) =>
     compareSlugs(left.slug, right.slug),
   );
+  const recordBySlug = new Map(
+    sortedRecords.map((record) => [record.slug, record]),
+  );
   const residuals = sortedRecords.map((record) => record.residualLog);
   const absolute = residuals.map((value) => Math.abs(value));
 
@@ -365,7 +377,7 @@ export function evaluateValuationModel(
   ]);
 
   targets.forEach((target) => {
-    const record = sortedRecords.find((entry) => entry.slug === target.slug);
+    const record = recordBySlug.get(target.slug);
     if (record === undefined) {
       throw new ValuationInputError(
         `missing evaluation record for ${target.slug}`,
@@ -379,7 +391,7 @@ export function evaluateValuationModel(
         : 'market-cap-rest';
     (tailBuckets.get(tailKey) as EvaluationRecord[]).push(record);
     if (model.categoryStats.length > 0) {
-      const categoryKey = categorySegment(model, target.category, options);
+      const categoryKey = categorySegment(model, target.category);
       (categoryBuckets.get(categoryKey) as EvaluationRecord[]).push(record);
     }
   });
@@ -418,8 +430,13 @@ export function evaluateValuationModel(
       residuals.reduce((total, value) => total + value * value, 0) /
         residuals.length,
     ),
+    medianSignedLogError: median(residuals),
+    meanSignedLogError: mean(residuals),
     medianAbsolutePercentageError:
-      100 * median(residuals.map((value) => Math.abs(Math.exp(value) - 1))),
+      100 *
+      median(
+        residuals.map((value) => Math.abs(1 - Math.exp(-value))),
+      ),
     coverage:
       sortedRecords.filter((record) => record.insideInterval).length /
       sortedRecords.length,
@@ -863,5 +880,273 @@ export function benchmarkValuation(
         'Compares market-cap/TVL structure across tokenized peers in one frozen snapshot. It is not a launch backtest, forecast, or probability of future market cap.',
     }),
     limits: BENCHMARK_LIMITS,
+  });
+}
+
+export interface DossierSegmentSummary {
+  readonly segment: string;
+  readonly sampleN: number;
+  readonly medianAbsLogError: number;
+  readonly coverage: number;
+}
+
+export interface DossierMetricSummary {
+  readonly sampleN: number;
+  readonly medianAbsLogError: number;
+  readonly medianAbsolutePercentageError: number;
+  readonly medianSignedLogError: number;
+  readonly meanSignedLogError: number;
+  readonly coverage: number;
+  readonly medianIntervalLogWidth: number;
+  readonly segments: readonly DossierSegmentSummary[];
+}
+
+export interface DossierModelSummary {
+  readonly kind: ValuationModelKind;
+  readonly fit: RegressionFit | null;
+  readonly features: readonly ValuationFeature[];
+  readonly categoryShrinkage: number;
+  readonly minCategoryN: number;
+}
+
+export interface DossierFeatureAblation {
+  readonly fit: RegressionFit;
+  readonly features: readonly ValuationFeature[];
+  readonly bestScore: number;
+  readonly bestShrinkage: number;
+  readonly deltaVsBase: number;
+}
+
+export interface DossierValuationSummary {
+  readonly count: number;
+  readonly watchlistN: number;
+  readonly candidateN: number;
+  readonly actualMarketCapN: number;
+  readonly tokenStatusCounts: Readonly<Record<string, number>>;
+  readonly evidenceFlagCounts: Readonly<Record<string, number>>;
+  readonly impliedMarketCapUsd: {
+    readonly min: number;
+    readonly p10: number;
+    readonly median: number;
+    readonly p90: number;
+    readonly max: number;
+  };
+  readonly medianIntervalLogWidth: number;
+}
+
+export interface DossierSummary {
+  readonly asOf: string;
+  readonly method: 'cross-sectional-peer-benchmark';
+  readonly peerN: number;
+  readonly candidateN: number;
+  readonly watchlistN: number;
+  readonly split: {
+    readonly trainN: number;
+    readonly holdoutN: number;
+    readonly holdoutFraction: number;
+    readonly seed: string;
+  };
+  readonly modelSelection: {
+    readonly folds: number;
+    readonly trainingSampleN: number;
+    readonly bestRawScore: number;
+    readonly selectedCvScore: number;
+    readonly toleranceLog: number;
+    readonly selected: DossierModelSummary;
+    readonly featureAblation: readonly DossierFeatureAblation[];
+  };
+  readonly calibration: {
+    readonly level: number;
+    readonly sampleN: number;
+    readonly lowerLogOffset: number;
+    readonly upperLogOffset: number;
+    readonly coverage: number;
+  };
+  readonly holdout: {
+    readonly sampleN: number;
+    readonly baseline: DossierMetricSummary;
+    readonly categoryBaseline: DossierMetricSummary;
+    readonly selected: DossierMetricSummary;
+  };
+  readonly final: {
+    readonly fitSampleN: number;
+    readonly coefficients: readonly number[];
+    readonly iterations: number;
+    readonly converged: boolean;
+    readonly supportedCategoryN: number;
+    readonly suppressedCategoryN: number;
+  };
+  readonly valuations: DossierValuationSummary;
+  readonly limits: readonly string[];
+}
+
+function dossierMetric(evaluation: ModelEvaluation): DossierMetricSummary {
+  return Object.freeze({
+    sampleN: evaluation.sampleN,
+    medianAbsLogError: evaluation.medianAbsLogError,
+    medianAbsolutePercentageError: evaluation.medianAbsolutePercentageError,
+    medianSignedLogError: evaluation.medianSignedLogError,
+    meanSignedLogError: evaluation.meanSignedLogError,
+    coverage: evaluation.coverage,
+    medianIntervalLogWidth: evaluation.medianIntervalLogWidth,
+    segments: Object.freeze(
+      evaluation.segments.map((segment) =>
+        Object.freeze({
+          segment: segment.segment,
+          sampleN: segment.sampleN,
+          medianAbsLogError: segment.medianAbsLogError,
+          coverage: segment.coverage,
+        }),
+      ),
+    ),
+  });
+}
+
+function dossierModel(spec: ValuationModelSpec): DossierModelSummary {
+  return Object.freeze({
+    kind: spec.kind,
+    fit: spec.fit,
+    features: Object.freeze([...spec.features]),
+    categoryShrinkage: spec.categoryShrinkage,
+    minCategoryN: spec.minCategoryN,
+  });
+}
+
+function dossierValuationSummary(
+  valuations: readonly TokenValuation[],
+): DossierValuationSummary {
+  const tokenStatusCounts: Record<string, number> = {
+    'already-tokenized': 0,
+    'watchlist-unconfirmed': 0,
+    candidate: 0,
+  };
+  const flagCounts = new Map<string, number>();
+  let watchlistN = 0;
+  let candidateN = 0;
+  let actualMarketCapN = 0;
+  const marketCaps: number[] = [];
+
+  valuations.forEach((valuation) => {
+    tokenStatusCounts[valuation.tokenStatus] =
+      (tokenStatusCounts[valuation.tokenStatus] ?? 0) + 1;
+    if (valuation.source === 'watchlist') watchlistN += 1;
+    else candidateN += 1;
+    if (valuation.actualMarketCapUsd !== null) actualMarketCapN += 1;
+    marketCaps.push(valuation.impliedMarketCapUsd);
+    valuation.evidenceFlags.forEach((flag) => {
+      flagCounts.set(flag, (flagCounts.get(flag) ?? 0) + 1);
+    });
+  });
+  marketCaps.sort((left, right) => left - right);
+
+  return Object.freeze({
+    count: valuations.length,
+    watchlistN,
+    candidateN,
+    actualMarketCapN,
+    tokenStatusCounts: Object.freeze(tokenStatusCounts),
+    evidenceFlagCounts: Object.freeze(
+      Object.fromEntries(
+        [...flagCounts.entries()].sort(([left], [right]) =>
+          compareSlugs(left, right),
+        ),
+      ),
+    ),
+    impliedMarketCapUsd: Object.freeze({
+      min: marketCaps[0] as number,
+      p10: quantileSorted(marketCaps, 0.1),
+      median: quantileSorted(marketCaps, 0.5),
+      p90: quantileSorted(marketCaps, 0.9),
+      max: marketCaps[marketCaps.length - 1] as number,
+    }),
+    medianIntervalLogWidth: median(
+      valuations.map((valuation) => valuation.interval.widthLog),
+    ),
+  });
+}
+
+function dossierLimits(intervalLevel: number): readonly string[] {
+  const percent = Math.round(intervalLevel * 100);
+  return Object.freeze([
+    `The ${percent}% band is a global out-of-fold empirical interval, not a precision guarantee or probability.`,
+    'Cross-sectional peer benchmark only; not a forecast, launch backtest, or probability of future market cap.',
+    'Peers are unevenly supported by category; sparse category offsets are suppressed by minCategoryN.',
+    'Implied market caps are not FDV and depend on the frozen peer snapshot.',
+  ]);
+}
+
+/**
+ * Compact dashboard payload for one dossier. It deliberately drops raw
+ * valuation rows, peer examples, records, split slug lists and model IDs. Use
+ * the full `ValuationBenchmark` for audits; use this for display/transport.
+ */
+export function toDossierSummary(
+  benchmark: ValuationBenchmark,
+): DossierSummary {
+  const selected = benchmark.modelSelection.selected;
+  const categoryStats = benchmark.final.model.categoryStats;
+  const supportedCategoryN = categoryStats.filter(
+    (category) => category.supported,
+  ).length;
+  const suppressedCategoryN = categoryStats.filter(
+    (category) => category.belowMinCategoryN,
+  ).length;
+
+  return Object.freeze({
+    asOf: benchmark.asOf,
+    method: benchmark.method,
+    peerN: benchmark.final.fitSampleN,
+    candidateN: benchmark.valuations.length,
+    watchlistN: benchmark.valuations.filter(
+      (valuation) => valuation.source === 'watchlist',
+    ).length,
+    split: Object.freeze({
+      trainN: benchmark.split.trainN,
+      holdoutN: benchmark.split.holdoutN,
+      holdoutFraction: benchmark.options.holdoutFraction,
+      seed: benchmark.seed,
+    }),
+    modelSelection: Object.freeze({
+      folds: benchmark.modelSelection.folds,
+      trainingSampleN: benchmark.modelSelection.trainingSampleN,
+      bestRawScore: benchmark.modelSelection.bestRawScore,
+      selectedCvScore: benchmark.modelSelection.selectedCvScore,
+      toleranceLog: benchmark.modelSelection.toleranceLog,
+      selected: dossierModel(selected),
+      featureAblation: Object.freeze(
+        benchmark.modelSelection.featureAblation.map((row) =>
+          Object.freeze({
+            fit: row.fit,
+            features: Object.freeze([...row.features]),
+            bestScore: row.bestScore,
+            bestShrinkage: row.bestShrinkage,
+            deltaVsBase: row.deltaVsBase,
+          }),
+        ),
+      ),
+    }),
+    calibration: Object.freeze({
+      level: benchmark.calibrationPool.level,
+      sampleN: benchmark.calibrationPool.sampleN,
+      lowerLogOffset: benchmark.final.calibration.lowerLogOffset,
+      upperLogOffset: benchmark.final.calibration.upperLogOffset,
+      coverage: benchmark.final.calibration.coverage,
+    }),
+    holdout: Object.freeze({
+      sampleN: benchmark.holdout.sampleN,
+      baseline: dossierMetric(benchmark.holdout.baseline),
+      categoryBaseline: dossierMetric(benchmark.holdout.categoryBaseline),
+      selected: dossierMetric(benchmark.holdout.selected),
+    }),
+    final: Object.freeze({
+      fitSampleN: benchmark.final.fitSampleN,
+      coefficients: Object.freeze([...benchmark.final.model.coefficients]),
+      iterations: benchmark.final.model.iterations,
+      converged: benchmark.final.model.converged,
+      supportedCategoryN,
+      suppressedCategoryN,
+    }),
+    valuations: dossierValuationSummary(benchmark.valuations),
+    limits: dossierLimits(benchmark.calibrationPool.level),
   });
 }

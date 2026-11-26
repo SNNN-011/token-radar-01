@@ -27,8 +27,10 @@ import {
   calibrateValuationModel,
   evaluateValuationModel,
   selectValuationModel,
+  toDossierSummary,
 } from '../lib/evaluation.ts';
 import type {
+  DossierSummary,
   ModelEvaluation,
   ValuationBenchmark,
 } from '../lib/evaluation.ts';
@@ -471,6 +473,9 @@ test('scale-aware model shrinks category residual medians toward zero', () => {
   assert.ok(b);
   assert.equal(a.n, 6);
   assert.equal(b.n, 6);
+  assert.equal(a.supported, true);
+  assert.equal(a.offsetApplied, true);
+  assert.equal(a.belowMinCategoryN, false);
   assert.ok(Math.abs((a.residualMedianLog as number) - 1) < 1e-6);
   assert.ok(Math.abs((b.residualMedianLog as number) + 1) < 1e-6);
   assert.equal(a.weight, 0.75);
@@ -506,6 +511,65 @@ test('scale-aware model shrinks category residual medians toward zero', () => {
   const heavyA = heavy.categoryStats.find((entry) => entry.category === 'A');
   assert.ok(heavyA);
   assert.ok(Math.abs(heavyA.offsetLog) < 0.01);
+});
+
+test('scale model suppresses category offsets below minCategoryN', () => {
+  const all = scaleFixture();
+  const source = [
+    ...all.filter((entry) => entry.category === 'A'),
+    ...all.filter((entry) => entry.category === 'B').slice(0, 2),
+  ];
+  const model = fitValuationModel(
+    source,
+    modelSpec({
+      id: 'scale-pooled:ols:base:k2',
+      kind: 'scale-partially-pooled',
+      fit: 'ols',
+      categoryShrinkage: 2,
+      minCategoryN: 3,
+    }),
+    options(),
+  );
+  const b = model.categoryStats.find((entry) => entry.category === 'B');
+  assert.ok(b);
+  assert.equal(b.n, 2);
+  assert.equal(b.supported, false);
+  assert.equal(b.belowMinCategoryN, true);
+  assert.equal(b.offsetApplied, false);
+  assert.equal(b.offsetLog, 0);
+  assert.equal(b.weight, 0);
+  assert.ok(Math.abs(b.residualMedianLog as number) > 0.01);
+
+  const target = {
+    slug: 'thin-target',
+    category: 'B',
+    tvlUsd: Math.exp(2),
+    change7d: 0,
+    ageDays: 365,
+  };
+  const globalPrediction =
+    (model.coefficients[0] as number) +
+    (model.coefficients[1] as number) * Math.log(target.tvlUsd);
+  assert.ok(
+    Math.abs(predictLogMarketCap(model, target) - globalPrediction) < 1e-12,
+  );
+
+  const valuation = valueToken(
+    {
+      ...target,
+      watchlist: false,
+    },
+    model,
+    source,
+    calibrationFixture({
+      sampleN: 40,
+      lowerLogOffset: -0.1,
+      upperLogOffset: 0.1,
+    }),
+    options(),
+  );
+  assert.ok(valuation.evidenceFlags.includes('sparse-category'));
+  assert.ok(valuation.evidenceFlags.includes('category-offset-suppressed'));
 });
 
 test('scale-aware model supports capped change and age features without null leaks', () => {
@@ -736,7 +800,12 @@ test('evaluateValuationModel reports log error, honest coverage and interval wid
   assert.equal(evaluation.intervalLevel, 0.8);
   assert.ok(Math.abs(evaluation.medianAbsLogError - Math.log(2)) < 1e-12);
   assert.ok(
-    Math.abs(evaluation.medianAbsolutePercentageError - 75) < 1e-9,
+    Math.abs(evaluation.medianAbsolutePercentageError - 80) < 1e-9,
+    'percentage error must divide by actual, not predicted',
+  );
+  assert.ok(Math.abs(evaluation.medianSignedLogError) < 1e-12);
+  assert.ok(
+    Math.abs(evaluation.meanSignedLogError - 0.044628710262841945) < 1e-12,
   );
   assert.ok(Math.abs(evaluation.coverage - 0.6) < 1e-12);
   assert.ok(
@@ -906,6 +975,29 @@ test('evaluateValuationModel rejects empty or malformed evaluation inputs', () =
   );
 });
 
+test('evaluateValuationModel rejects any target that was in the fit set', () => {
+  assert.throws(
+    () =>
+      evaluateValuationModel(
+        evaluationModel(),
+        calibrationFixture(),
+        [
+          peer({
+            slug: 'p10',
+            tvlUsd: 10,
+            marketCapUsd: 40,
+          }),
+        ],
+        options(),
+      ),
+    (error: unknown) => {
+      assert.ok(error instanceof ValuationInputError);
+      assert.match(error.message, /fit set|not fit|leak/i);
+      return true;
+    },
+  );
+});
+
 test('buildCandidateSpecs is a deterministic, unique model grid', () => {
   const first = buildCandidateSpecs(options());
   const second = buildCandidateSpecs(options());
@@ -986,6 +1078,57 @@ test('valueToken emits a point market-cap estimate, interval and stable peer exa
     false,
   );
   assertDeepFrozen(valuation);
+});
+
+test('valueToken requires the exact unique fit peer set and an out-of-fit target', () => {
+  const source = [
+    peer({ slug: 'p-a', category: 'Dexs', tvlUsd: 100, marketCapUsd: 200 }),
+    peer({ slug: 'p-b', category: 'Dexs', tvlUsd: 100, marketCapUsd: 200 }),
+    peer({ slug: 'p-c', category: 'Dexs', tvlUsd: 100, marketCapUsd: 200 }),
+  ];
+  const model = fitValuationModel(
+    source,
+    modelSpec({ id: 'global-median-ratio', kind: 'global-median-ratio' }),
+    options(),
+  );
+  const calibration = calibrationFixture({ sampleN: 40 });
+  const target = {
+    slug: 'outside-target',
+    category: 'Dexs',
+    tvlUsd: 100,
+    change7d: null,
+    ageDays: null,
+  };
+
+  assert.throws(
+    () => valueToken(target, model, source.slice(0, 2), calibration, options()),
+    /exact.*fit/i,
+  );
+  assert.throws(
+    () =>
+      valueToken(
+        target,
+        model,
+        [
+          ...source,
+          peer({ slug: 'p-extra', tvlUsd: 100, marketCapUsd: 200 }),
+        ],
+        calibration,
+        options(),
+      ),
+    /exact.*fit/i,
+  );
+  assert.throws(
+    () =>
+      valueToken(
+        { ...target, slug: 'p-a' },
+        model,
+        source,
+        calibration,
+        options(),
+      ),
+    /fit set|not fit|leak/i,
+  );
 });
 
 test('valueToken explains category fallback, sparse support and unseen categories', () => {
@@ -1321,6 +1464,45 @@ test('benchmarkValuation is deterministic and fully JSON-serializable', () => {
   assert.deepEqual(roundTrip, first);
 });
 
+test('toDossierSummary is compact, signed and free of raw IDs and records', () => {
+  const benchmark = benchmarkValuation(
+    benchmarkReport(),
+    options({ folds: 4, seed: 'dossier-seed' }),
+  );
+  const summary: DossierSummary = toDossierSummary(benchmark);
+  const serialized = JSON.stringify(summary);
+
+  assert.ok(
+    Buffer.byteLength(serialized, 'utf8') <= 8192,
+    `dossier summary is ${Buffer.byteLength(serialized, 'utf8')} bytes`,
+  );
+  assert.doesNotMatch(
+    serialized,
+    /"(?:slug|id|modelId|records|fitSlugs|targetSlugs|peerExamples|candidates)":/,
+  );
+  assert.equal(summary.valuations.count, 6);
+  assert.equal(summary.valuations.watchlistN, 3);
+  assert.equal(summary.valuations.candidateN, 3);
+  assert.deepEqual(summary.valuations.tokenStatusCounts, {
+    'already-tokenized': 0,
+    'watchlist-unconfirmed': 3,
+    candidate: 3,
+  });
+  assert.equal(summary.holdout.selected.sampleN, 12);
+  assert.ok(Number.isFinite(summary.holdout.selected.medianSignedLogError));
+  assert.ok(Number.isFinite(summary.holdout.selected.meanSignedLogError));
+  assert.ok(
+    summary.limits.some((limit) => /80%/.test(limit) && /not.*precision/i.test(limit)),
+  );
+  assert.ok(
+    summary.limits.some(
+      (limit) => /cross-sectional/i.test(limit) && /not.*forecast/i.test(limit),
+    ),
+  );
+  assert.equal(summary.calibration.level, 0.8);
+  assert.equal(summary.calibration.sampleN, 28);
+});
+
 test('valueCandidates values every candidate with a stable slug order', () => {
   const report = benchmarkReport();
   const peersPrepared = prepareValuationPeers(report);
@@ -1352,17 +1534,103 @@ test('valueCandidates values every candidate with a stable slug order', () => {
   );
 });
 
+test('valueCandidates preserves already-tokenized watchlist status and actual mcap', () => {
+  const report = adaptSnapshot(
+    doc(
+      [
+        ...Array.from({ length: 5 }, (_, index) =>
+          protocol({
+            slug: `peer-${index}`,
+            name: `Peer ${index}`,
+            category: 'Dexs',
+            tvl_usd: 100,
+            mcap_usd: 200,
+            gecko_id: `peer-${index}`,
+            symbol: `P${index}`,
+          }),
+        ),
+        protocol({
+          slug: 'watch-already',
+          name: 'Watch Already',
+          category: 'Dexs',
+          tvl_usd: 200,
+          mcap_usd: 500,
+          gecko_id: 'watch-already',
+          symbol: 'WA',
+        }),
+        protocol({
+          slug: 'watch-unconfirmed',
+          name: 'Watch Unconfirmed',
+          category: 'Dexs',
+          tvl_usd: 200,
+          mcap_usd: null,
+          gecko_id: null,
+          symbol: null,
+        }),
+        protocol({
+          slug: 'missing-metadata',
+          name: 'Missing Metadata',
+          category: 'Dexs',
+          tvl_usd: 200,
+          mcap_usd: null,
+          gecko_id: null,
+          symbol: null,
+        }),
+      ],
+      ['watch-already', 'watch-unconfirmed'],
+    ),
+  );
+  const peersPrepared = prepareValuationPeers(report);
+  const model = fitValuationModel(
+    peersPrepared,
+    modelSpec({ id: 'global-median-ratio', kind: 'global-median-ratio' }),
+    options(),
+  );
+  const valuations = valueCandidates(
+    report,
+    model,
+    peersPrepared,
+    calibrationFixture({ sampleN: 40 }),
+    options(),
+  );
+  const bySlug = new Map(valuations.map((valuation) => [valuation.slug, valuation]));
+
+  assert.equal(valuations.length, 3, 'already-tokenized rows are not skipped');
+  const already = bySlug.get('watch-already');
+  assert.ok(already);
+  assert.equal(already.source, 'watchlist');
+  assert.equal(already.tokenStatus, 'already-tokenized');
+  assert.equal(already.actualMarketCapUsd, 500);
+
+  const unconfirmed = bySlug.get('watch-unconfirmed');
+  assert.ok(unconfirmed);
+  assert.equal(unconfirmed.source, 'watchlist');
+  assert.equal(unconfirmed.tokenStatus, 'watchlist-unconfirmed');
+  assert.equal(unconfirmed.actualMarketCapUsd, null);
+
+  const missing = bySlug.get('missing-metadata');
+  assert.ok(missing);
+  assert.equal(missing.source, 'candidate');
+  assert.equal(missing.tokenStatus, 'candidate');
+  assert.equal(missing.actualMarketCapUsd, null);
+});
+
 const REAL_SNAPSHOT_SHA256 =
   '42a71213519479f3a180cc5010cbbf6bd18a2447fa0ad29e4c5122b6c9184393';
 const realSnapshotPath =
   process.env.TOKEN_RADAR_SNAPSHOT ??
   'D:/hermes/cache/scratch/token-radar-snapshot/snapshot.json';
 const realSnapshotAvailable = existsSync(realSnapshotPath);
+const realSnapshotRequired = process.env.TOKEN_RADAR_REQUIRE_SNAPSHOT === '1';
 
 test(
   'benchmarks the verified real snapshot without holdout leakage',
-  { skip: !realSnapshotAvailable },
+  { skip: !realSnapshotAvailable && !realSnapshotRequired },
   () => {
+    assert.ok(
+      realSnapshotAvailable,
+      `TOKEN_RADAR_REQUIRE_SNAPSHOT=1 but snapshot is missing: ${realSnapshotPath}`,
+    );
     const bytes = readFileSync(realSnapshotPath);
     assert.equal(
       createHash('sha256').update(bytes).digest('hex'),
@@ -1372,7 +1640,20 @@ test(
     const raw: unknown = JSON.parse(bytes.toString('utf8'));
     const report = adaptSnapshot(raw);
     assert.equal(report.peers.length, 127);
-    assert.equal(report.candidates.length, 198);
+    assert.equal(report.candidates.length, 197);
+    assert.equal(
+      report.candidates.filter((row) => row.reason === 'watchlist').length,
+      40,
+    );
+    const circleGateway = report.excluded.find(
+      (row) => row.slug === 'circle-gateway',
+    );
+    assert.ok(circleGateway, 'official circle-gateway exclusion is missing');
+    assert.ok(circleGateway.exclusions.includes('bridged-category'));
+    assert.equal(
+      report.candidates.some((row) => row.slug === 'circle-gateway'),
+      false,
+    );
 
     const benchmark = benchmarkValuation(report, {
       seed: 'token-radar-valuation-v1',
@@ -1403,9 +1684,20 @@ test(
       assert.equal(evaluation.fitSampleN, 89);
       assert.deepEqual(evaluation.fitSlugs, benchmark.split.trainSlugs);
       assert.ok(
+        benchmark.split.holdoutSlugs.every(
+          (slug) => !evaluation.fitSlugs.includes(slug),
+        ),
+      );
+      assert.ok(
         Number.isFinite(evaluation.medianAbsLogError) &&
           evaluation.medianAbsLogError >= 0,
       );
+      assert.ok(
+        Number.isFinite(evaluation.medianAbsolutePercentageError) &&
+          evaluation.medianAbsolutePercentageError >= 0,
+      );
+      assert.ok(Number.isFinite(evaluation.medianSignedLogError));
+      assert.ok(Number.isFinite(evaluation.meanSignedLogError));
       assert.ok(evaluation.coverage >= 0 && evaluation.coverage <= 1);
       assert.ok(
         Number.isFinite(evaluation.medianIntervalLogWidth) &&
@@ -1435,10 +1727,17 @@ test(
       report.peers.map((row) => row.slug),
     );
     assert.equal(benchmark.final.calibration.sampleN, 89);
-    assert.equal(benchmark.valuations.length, 198);
+    assert.equal(benchmark.valuations.length, report.candidates.length);
     assert.deepEqual(
       benchmark.valuations.map((valuation) => valuation.slug),
       report.candidates.map((row) => row.slug),
+    );
+    assert.equal(
+      report.candidates.filter((row) =>
+        row.flags.includes('already-tokenized'),
+      ).length,
+      0,
+      'this snapshot has no already-tokenized watchlist rows',
     );
     benchmark.valuations.forEach((valuation) => {
       assert.equal(valuation.pointBasis, 'market-cap');
@@ -1450,6 +1749,7 @@ test(
       assert.ok(valuation.peerExamples.length > 0);
       assert.ok(valuation.peerExamples.length <= 5);
       assert.ok(Array.isArray(valuation.evidenceFlags));
+      assert.match(valuation.tokenStatus, /already-tokenized|watchlist-unconfirmed|candidate/);
     });
 
     assert.equal(benchmark.interpretation.isLaunchBacktest, false);
@@ -1462,5 +1762,9 @@ test(
       JSON.parse(JSON.stringify(benchmark)),
       benchmark,
     );
+
+    const summary = toDossierSummary(benchmark);
+    assert.ok(Buffer.byteLength(JSON.stringify(summary), 'utf8') <= 8192);
+    assert.equal(summary.valuations.count, report.candidates.length);
   },
 );
