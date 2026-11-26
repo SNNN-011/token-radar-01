@@ -38,6 +38,7 @@ export type ClassificationReason =
 export type LedgerFlag =
   | 'apparent-wrapper'
   | 'versioned-name'
+  | 'already-tokenized'
   | 'tokenized-without-usable-market-cap'
   | 'ambiguous-symbol-only'
   | 'missing-token-metadata'
@@ -213,6 +214,15 @@ function flagsFor(
 
   if (signals.wrapper) flags.push('apparent-wrapper');
   if (signals.versioned) flags.push('versioned-name');
+
+  // Watchlist status is authoritative and remains a candidate. This flag
+  // records strong token evidence without changing that status.
+  if (
+    token.watchlist === true &&
+    (signals.usableMarketCap || signals.geckoId !== undefined)
+  ) {
+    flags.push('already-tokenized');
+  }
 
   if (signals.geckoId !== undefined && !signals.usableMarketCap) {
     flags.push('tokenized-without-usable-market-cap');

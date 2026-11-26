@@ -223,8 +223,29 @@ test('keeps an otherwise eligible watchlist token out of peers', () => {
 
   assert.equal(result.peers.length, 0);
   const row = onlyRow(result.candidates);
+  assert.equal(row.status, 'candidate');
   assert.equal(row.reason, 'watchlist');
-  assert.deepEqual(row.flags, []);
+  assert.deepEqual(row.flags, ['already-tokenized']);
+});
+
+test('emits already-tokenized once when a watchlist row has both strong signals', () => {
+  const result = classify(
+    makeSnapshot([
+      makeToken({
+        slug: 'keeper-gecko',
+        name: 'Keeper Gecko',
+        symbol: 'KEEP',
+        geckoId: 'keeper-gecko',
+        marketCapUsd: 1_000,
+        watchlist: true,
+      }),
+    ]),
+  );
+
+  const row = onlyRow(result.candidates);
+  assert.equal(row.status, 'candidate');
+  assert.equal(row.reason, 'watchlist');
+  assert.deepEqual(row.flags, ['already-tokenized']);
 });
 
 test('preserves a watchlist wrapper and its tokenized signal', () => {
@@ -241,9 +262,11 @@ test('preserves a watchlist wrapper and its tokenized signal', () => {
   );
 
   const row = onlyRow(result.candidates);
+  assert.equal(row.status, 'candidate');
   assert.equal(row.reason, 'watchlist');
   assert.deepEqual(row.flags, [
     'apparent-wrapper',
+    'already-tokenized',
     'tokenized-without-usable-market-cap',
     'unusable-market-cap',
   ]);
@@ -414,7 +437,7 @@ test('emits one lossless ledger row per input token', () => {
   });
 });
 
-test('partitions 134 synthetic rows with every status reconciled', () => {
+test('partitions 234 synthetic rows with 110 genuine candidates, not peers', () => {
   const peers = Array.from({ length: 100 }, (_, index) =>
     makeToken({
       slug: `peer-${String(index).padStart(3, '0')}`,
@@ -423,8 +446,20 @@ test('partitions 134 synthetic rows with every status reconciled', () => {
       marketCapUsd: 1_000 + index,
     }),
   );
-  const watchlist = Array.from({ length: 10 }, (_, index) =>
-    makeToken({ slug: `watch-${index}`, watchlist: true }),
+  const eligibleCandidates = Array.from({ length: 100 }, (_, index) =>
+    makeToken({
+      slug: `candidate-${String(index).padStart(3, '0')}`,
+      watchlist: true,
+    }),
+  );
+  const weakWatchlist = Array.from({ length: 10 }, (_, index) =>
+    makeToken({
+      slug: `watch-weak-${index}`,
+      name: 'Watch Weak',
+      symbol: 'WW',
+      marketCapUsd: null,
+      watchlist: true,
+    }),
   );
   const wrappers = Array.from({ length: 6 }, (_, index) =>
     makeToken({
@@ -462,7 +497,8 @@ test('partitions 134 synthetic rows with every status reconciled', () => {
 
   const tokens = [
     ...peers,
-    ...watchlist,
+    ...eligibleCandidates,
+    ...weakWatchlist,
     ...wrappers,
     ...versioned,
     ...geckoNoCap,
@@ -470,23 +506,28 @@ test('partitions 134 synthetic rows with every status reconciled', () => {
   ];
   const result = classify({ tokens });
 
-  assert.equal(tokens.length, 134);
-  assert.equal(result.ledger.length, 134);
+  assert.equal(tokens.length, 234);
+  assert.equal(result.ledger.length, 234);
   assert.equal(result.peers.length, 100);
-  assert.equal(result.candidates.length, 10);
+  assert.equal(result.candidates.length, 110);
   assert.equal(result.excluded.length, 24);
   assert.deepEqual(statusCounts(result), {
     peer: 100,
-    candidate: 10,
+    candidate: 110,
     excluded: 24,
   });
   assert.equal(
     result.peers.length + result.candidates.length + result.excluded.length,
     result.ledger.length,
   );
-  assert.ok(result.peers.length + result.candidates.length >= 100);
-  assert.equal(new Set(result.ledger.map((row) => row.slug)).size, 134);
+  assert.ok(result.candidates.length >= 100);
+  assert.equal(new Set(result.ledger.map((row) => row.slug)).size, 234);
   assert.ok(result.ledger.every((row) => row.slug === row.token.slug));
+  assert.equal(
+    result.candidates.filter((row) => row.flags.includes('already-tokenized'))
+      .length,
+    100,
+  );
   assert.ok(
     result.candidates.every(
       (row) => row.status === 'candidate' && row.reason === 'watchlist',
@@ -496,6 +537,12 @@ test('partitions 134 synthetic rows with every status reconciled', () => {
     result.peers.every((row) => row.status === 'peer' && row.reason === 'peer'),
   );
   assert.ok(result.excluded.every((row) => row.status === 'excluded'));
+
+  const weak = result.candidates.filter(
+    (row) => row.token.marketCapUsd === null,
+  );
+  assert.equal(weak.length, 10);
+  assert.ok(weak.every((row) => row.flags.includes('ambiguous-symbol-only')));
 
   const sortedSlugs = [...result.ledger]
     .map((row) => row.slug)
